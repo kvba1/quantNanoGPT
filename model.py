@@ -15,6 +15,85 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+
+def round(x):
+    return (torch.round(x) - x).detach() + x
+
+class Quantizer(nn.Module):
+    def __init__(self):
+        super(Quantizer, self).__init__()
+    
+    def forward(self, weight, e, b):
+        scaled = weight * (2 ** (-e))
+        qmin = -2 ** (F.relu(b) - 1)
+        qmax = 2 ** (F.relu(b) - 1) - 1
+        clamped = torch.clamp(scaled, qmin, qmax)
+        qw = round(clamped)
+
+        return (2 ** e) * qw
+
+class QLinearPerChannel(nn.Module):
+    def __init__(self, in_features, out_features, device="cuda"):
+        super().__init__()
+        self.device = device
+        self.in_features = in_features
+        self.out_features = out_features
+        
+        self.num_tiles_col = 1
+        
+        self.tile_size = math.ceil(in_features / self.num_tiles_col)
+        
+        scale = 1 / math.sqrt(in_features)
+        self.weight = nn.Parameter(
+            torch.FloatTensor(out_features, in_features).uniform_(-scale, scale)
+        )
+
+        self.e = nn.Parameter(torch.full((out_features, self.num_tiles_col), -8.))
+        self.b = nn.Parameter(torch.full((out_features, self.num_tiles_col),  4.))
+
+        self.quantizer = Quantizer()
+
+    def calculate_sparsity(self, eps=1e-6):
+        b_activated = F.relu(self.b)
+        sparse_blocks = (b_activated < eps).float()
+        sparsity = sparse_blocks.mean().item()
+        return sparsity
+    
+    def get_sparsity(self):
+        sparsity = (self.weight == 0).float().mean().item()
+        return sparsity
+    
+    def qbits(self):
+        return F.relu(self.b).mean()
+    
+    def calculate_nbytes(self):
+        bitwidth = self.qbits()
+        total_weights = self.weight.numel()
+        total_bytes = (bitwidth * total_weights) / 8
+        return total_bytes
+
+    def forward(self, x):
+        weight = self.weight
+
+        total_cols = self.num_tiles_col * self.tile_size
+        pad_cols = total_cols - self.in_features
+        if pad_cols > 0:
+            weight_padded = F.pad(weight, (0, pad_cols, 0, 0))
+        else:
+            weight_padded = weight
+        
+        weight_tiles = weight_padded.view(self.out_features, self.num_tiles_col, self.tile_size)
+
+        e_exp = self.e.unsqueeze(-1)
+        b_exp = self.b.unsqueeze(-1)
+
+        quantized_tiles = self.quantizer(weight_tiles, e_exp, b_exp)
+
+        quantized_weight_padded = quantized_tiles.view(self.out_features, total_cols)
+        quantized_weight = quantized_weight_padded[:, :self.in_features].to(self.device)
+        
+        return F.linear(x, quantized_weight)
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -32,9 +111,9 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = QLinearPerChannel(config.n_embd, 3 * config.n_embd)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = QLinearPerChannel(config.n_embd, config.n_embd)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -79,9 +158,9 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc    = QLinearPerChannel(config.n_embd, 4 * config.n_embd)
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj  = QLinearPerChannel(4 * config.n_embd, config.n_embd)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -261,28 +340,54 @@ class GPT(nn.Module):
         return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+
+        quant_param_dict = {pn: p for pn, p in param_dict.items()
+                            if pn.endswith('.b') or pn.endswith('.e')}
+        normal_param_dict = {pn: p for pn, p in param_dict.items()
+                            if pn not in quant_param_dict}
+        quant_decay = [p for n, p in quant_param_dict.items() if p.dim() >= 2]
+        quant_nodecay = [p for n, p in quant_param_dict.items() if p.dim() < 2]
+
+        normal_decay = [p for n, p in normal_param_dict.items() if p.dim() >= 2]
+        normal_nodecay = [p for n, p in normal_param_dict.items() if p.dim() < 2]
+
         optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
+            # Quant decayed
+            {
+                'params': quant_decay,
+                'weight_decay': weight_decay,
+                'lr': learning_rate,
+            },
+            # Quant no-decay
+            {
+                'params': quant_nodecay,
+                'weight_decay': 0.0,
+                'lr': learning_rate,
+            },
+            # Normal decayed
+            {
+                'params': normal_decay,
+                'weight_decay': weight_decay,
+                'lr': learning_rate,
+            },
+            # Normal no-decay
+            {
+                'params': normal_nodecay,
+                'weight_decay': 0.0,
+                'lr': learning_rate,
+            },
         ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
+
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
+
+        optimizer = torch.optim.AdamW(optim_groups,
+                                    lr=learning_rate,
+                                    betas=betas,
+                                    **extra_args)
+        print(f"Using fused AdamW: {use_fused}")
 
         return optimizer
 

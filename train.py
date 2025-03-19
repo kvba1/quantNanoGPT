@@ -24,10 +24,11 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, QLinearPerChannel
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -103,7 +104,7 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
+#torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
@@ -170,7 +171,7 @@ elif init_from == 'resume':
     model = GPT(gptconf)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+    # sometimes a prefix like "_orig_mod." can appear, so let's remove it if needed
     unwanted_prefix = '_orig_mod.'
     for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
@@ -192,6 +193,37 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
+def compute_model_bytes(model):
+    total_bytes = 0.0
+    for module in model.modules():
+        if hasattr(module, "calculate_nbytes"):
+            total_bytes += module.calculate_nbytes()
+    return total_bytes
+
+def compute_model_sparsity(model, eps=1e-6):
+    total_sparsity = 0.0
+    count = 0
+    for module in model.modules():
+        if hasattr(module, "calculate_sparsity"):
+            total_sparsity += module.calculate_sparsity(eps=eps)
+            count += 1
+    return total_sparsity / count if count > 0 else 0.0
+
+def compute_avg_qbits(model):
+    total_q = 0.0
+    total_params_with_q = 0
+
+    for module in model.modules():
+        if isinstance(module, QLinearPerChannel):
+            avg_qbits = module.qbits()
+            nparams = module.weight.numel()
+            total_q += avg_qbits * nparams
+            total_params_with_q += nparams
+
+    if total_params_with_q == 0:
+        return 0.0
+    return total_q / total_params_with_q
+
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
@@ -210,6 +242,12 @@ if compile:
 # wrap model into DDP container
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
+
+val_losses_plot = []
+bytes_used_plot = []
+eval_steps_plot = []
+compression_rate_plot = []
+avg_qbits_plot = []
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -252,8 +290,11 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
-while True:
 
+total_params = raw_model.get_num_params()
+base_model_size = total_params * 4.0  # float32 bytes
+
+while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
@@ -262,14 +303,32 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        model_sparsity = compute_model_sparsity(raw_model)
+        model_size = compute_model_bytes(raw_model).item()  # current bytes
+        compression_rate = model_size / base_model_size
+        avg_qbits = compute_avg_qbits(raw_model).item()
+    
+        eval_steps_plot.append(iter_num)
+        bytes_used_plot.append(model_size)
+        val_losses_plot.append(losses['val'])
+        compression_rate_plot.append(compression_rate)
+        avg_qbits_plot.append(avg_qbits)
+        
+        print(f"iter {iter_num}: train loss {losses['train']:.4f}, "
+            f"val loss {losses['val']:.4f}, "
+            f"model size {model_size:.2f} bytes, "
+            f"compression rate {compression_rate:.4f}, "
+            f"avg qbits {avg_qbits:.4f}")
+        
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
+                "mfu": running_mfu * 100,  # convert to percentage
+                "model/size_bytes": model_size,
+                "model/compression_rate": compression_rate,
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
@@ -287,22 +346,29 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
+    # forward backward update, with optional gradient accumulation
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            loss = loss / gradient_accumulation_steps
+
+            Q = 0.0
+            for layer in model.modules():
+                if isinstance(layer, QLinearPerChannel):
+                    layer_params = layer.weight.numel() if hasattr(layer, "weight") else 1
+                    Q += (layer.qbits() * layer_params) / total_params
+                    
+            alpha = 0.1
+            loss = loss + alpha * Q
+
+        # immediately async prefetch next batch while model is doing the forward pass
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
+
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
@@ -310,7 +376,6 @@ while True:
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
@@ -319,12 +384,19 @@ while True:
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
+        model_size = compute_model_bytes(raw_model)
+        compression_rate = model_size / base_model_size
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+            
+        print(f"iter {iter_num} (local {local_iter_num}): "
+              f"train loss {lossf:.4f}, "
+              f"model size {model_size:.2f} bytes, "
+              f"compression rate {compression_rate:.4f}, "
+              f"lr {lr:.4e}, "
+              f"mfu {running_mfu:.2f}%")
     iter_num += 1
     local_iter_num += 1
 
@@ -334,3 +406,51 @@ while True:
 
 if ddp:
     destroy_process_group()
+
+if master_process:
+    # Plot model size and validation loss
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+    color1 = 'tab:red'
+    ax1.set_xlabel("Iteration")
+    ax1.set_ylabel("Model Size (bytes)", color=color1)
+    ax1.plot(eval_steps_plot, bytes_used_plot, color=color1, label="Model Size")
+    ax1.tick_params(axis='y', labelcolor=color1)
+
+    ax2 = ax1.twinx()
+    color2 = 'tab:blue'
+    ax2.set_ylabel("Validation Loss", color=color2)
+    ax2.plot(eval_steps_plot, val_losses_plot, color=color2, label="Validation Loss")
+    ax2.tick_params(axis='y', labelcolor=color2)
+
+    plt.title("Model Size vs. Validation Loss")
+    fig.tight_layout()
+    fig.savefig("gpt_quant_training.png")
+    print("Saved plot to gpt_quant_training.png")
+
+    # Plot compression rate vs. iteration
+    fig4, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(eval_steps_plot, compression_rate_plot, label="Compression Rate")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Compression Rate (current bytes / float32 bytes)")
+    ax.set_title("Compression Rate during Training")
+    ax.legend()
+    fig4.tight_layout()
+    fig4.savefig("gpt_quant_compression_rate.png")
+    print("Saved plot to gpt_quant_compression_rate.png")
+    
+    
+    # Plot average bits per weight vs. iteration
+    fig5, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(eval_steps_plot, avg_qbits_plot, label="Average bits per weight during training")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Bits per weights")
+    ax.set_title("Average bits per weight")
+    
+    ax2 = ax.twinx()
+    color2 = 'tab:red'
+    ax2.set_ylabel("Validation Loss", color=color2)
+    ax2.plot(eval_steps_plot, val_losses_plot, color=color2, label="Validation Loss")
+
+    fig5.tight_layout()
+    fig5.savefig(f"gpt_quant_qbits_alpha01.png")
+    print("Saved plot to gpt_quant_qbits.png")
