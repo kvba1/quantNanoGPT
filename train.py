@@ -35,6 +35,7 @@ from model import GPTConfig, GPT, QLinearPerChannel
 # I/O
 out_dir = 'out'
 eval_interval = 2000
+learning_rate_quant = 0.5
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
@@ -266,7 +267,7 @@ def estimate_loss():
     return out
 
 # learning rate decay scheduler (cosine with warmup)
-def get_lr(it):
+def get_lr(it, min_lr, learning_rate):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
         return learning_rate * (it + 1) / (warmup_iters + 1)
@@ -296,9 +297,14 @@ base_model_size = total_params * 4.0  # float32 bytes
 
 while True:
     # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
+    lr = get_lr(iter_num, min_lr, learning_rate) if decay_lr else learning_rate
+    lr_quant = get_lr(iter_num, 0.05, learning_rate_quant) if decay_lr else learning_rate_quant
+    
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+        if param_group == optimizer.param_groups[0] or param_group == optimizer.param_groups[1]:
+            param_group['lr'] = lr_quant
+        else:
+            param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -396,6 +402,7 @@ while True:
               f"model size {model_size:.2f} bytes, "
               f"compression rate {compression_rate:.4f}, "
               f"lr {lr:.4e}, "
+              f'lr_quant {lr_quant:.4e}, '
               f"mfu {running_mfu:.2f}%")
         
     iter_num += 1
@@ -452,5 +459,5 @@ if master_process:
     ax2.plot(eval_steps_plot, val_losses_plot, color=color2, label="Validation Loss")
 
     fig5.tight_layout()
-    fig5.savefig(f"gpt_quant_qbits_alpha01.png")
+    fig5.savefig(f"gpt_quant_qbits_alpha.png")
     print("Saved plot to gpt_quant_qbits.png")
