@@ -356,7 +356,7 @@ class GPT(nn.Module):
             # Quant decayed
             {
                 'params': quant_decay,
-                'weight_decay': weight_decay,
+                'weight_decay': 0.0,
                 'lr': learning_rate,
             },
             # Quant no-decay

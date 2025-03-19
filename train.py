@@ -355,14 +355,14 @@ while True:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps
 
-            Q = 0.0
-            for layer in model.modules():
-                if isinstance(layer, QLinearPerChannel):
-                    layer_params = layer.weight.numel() if hasattr(layer, "weight") else 1
-                    Q += (layer.qbits() * layer_params) / total_params
+            # Q = 0.0
+            # for layer in model.modules():
+            #     if isinstance(layer, QLinearPerChannel):
+            #         layer_params = layer.weight.numel() if hasattr(layer, "weight") else 1
+            #         Q += (layer.qbits() * layer_params) / total_params
                     
-            alpha = 0.1
-            loss = loss + alpha * Q
+            # alpha = 0.1
+            # loss = loss + alpha * Q
 
         # immediately async prefetch next batch while model is doing the forward pass
         X, Y = get_batch('train')
@@ -397,6 +397,7 @@ while True:
               f"compression rate {compression_rate:.4f}, "
               f"lr {lr:.4e}, "
               f"mfu {running_mfu:.2f}%")
+        
     iter_num += 1
     local_iter_num += 1
 
@@ -438,13 +439,12 @@ if master_process:
     fig4.savefig("gpt_quant_compression_rate.png")
     print("Saved plot to gpt_quant_compression_rate.png")
     
-    
     # Plot average bits per weight vs. iteration
     fig5, ax = plt.subplots(figsize=(10, 6))
     ax.plot(eval_steps_plot, avg_qbits_plot, label="Average bits per weight during training")
     ax.set_xlabel("Iteration")
     ax.set_ylabel("Bits per weights")
-    ax.set_title("Average bits per weight")
+    ax.set_title("Average bits per weight vs Validation Loss")
     
     ax2 = ax.twinx()
     color2 = 'tab:red'
