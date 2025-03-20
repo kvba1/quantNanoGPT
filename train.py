@@ -29,7 +29,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT, QLinearPerChannel
-
+import pandas as pd
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -225,6 +225,13 @@ def compute_avg_qbits(model):
         return 0.0
     return total_q / total_params_with_q
 
+def total_quant_params(model):
+    total_params = 0
+    for module in model.modules():
+        if isinstance(module, QLinearPerChannel):
+            total_params += module.weight.numel()
+    return total_params
+
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
@@ -292,7 +299,7 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 
-total_params = raw_model.get_num_params()
+total_params = total_quant_params(raw_model)
 base_model_size = total_params * 4.0  # float32 bytes
 
 while True:
@@ -361,14 +368,14 @@ while True:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps
 
-            # Q = 0.0
-            # for layer in model.modules():
-            #     if isinstance(layer, QLinearPerChannel):
-            #         layer_params = layer.weight.numel() if hasattr(layer, "weight") else 1
-            #         Q += (layer.qbits() * layer_params) / total_params
+            Q = 0.0
+            for layer in model.modules():
+                if isinstance(layer, QLinearPerChannel):
+                    layer_params = layer.weight.numel() if hasattr(layer, "weight") else 1
+                    Q += (layer.qbits() * layer_params) / total_params
                     
-            # alpha = 0.1
-            # loss = loss + alpha * Q
+            alpha = 0.15
+            loss = loss + alpha * Q
 
         # immediately async prefetch next batch while model is doing the forward pass
         X, Y = get_batch('train')
@@ -416,6 +423,16 @@ if ddp:
     destroy_process_group()
 
 if master_process:
+    csv_filename = "gpt_quant_training_data.csv"
+    df = pd.DataFrame({
+        "Iteration": eval_steps_plot,
+        "Model Size (bytes)": bytes_used_plot,
+        "Validation Loss": val_losses_plot,
+        "Compression Rate": compression_rate_plot,
+        "Average Bits per Weight": avg_qbits_plot
+    })
+    df.to_csv(csv_filename, index=False)
+    print(f"Saved evaluation data to {csv_filename}")
     # Plot model size and validation loss
     fig, ax1 = plt.subplots(figsize=(10, 6))
     color1 = 'tab:red'
