@@ -93,6 +93,64 @@ class QLinearPerChannel(nn.Module):
         quantized_weight = quantized_weight_padded[:, :self.in_features].to(self.device)
         
         return F.linear(x, quantized_weight)
+    
+class QLinearTile2D(nn.Module):
+    def __init__(self, in_features, out_features, tile_size=32, device="cuda"):
+        super().__init__()
+        self.device = device
+        self.in_features = in_features
+        self.out_features = out_features
+        self.tile_size = tile_size
+        
+        self.num_tiles_row = math.ceil(out_features / tile_size)
+        self.num_tiles_col = math.ceil(in_features / tile_size)
+        
+        scale = 1 / math.sqrt(in_features)
+        self.weight = nn.Parameter(
+            torch.FloatTensor(out_features, in_features).uniform_(-scale, scale)
+        )
+        
+        self.e = nn.Parameter(torch.full((self.num_tiles_row, self.num_tiles_col), -8.))
+        self.b = nn.Parameter(torch.full((self.num_tiles_row, self.num_tiles_col), 4.))
+        self.quantizer = Quantizer()
+
+    def qbits(self):
+        return F.relu(self.b).mean()
+    
+    def calculate_nbytes(self):
+        bitwidth = self.qbits()
+        total_weights = self.weight.numel()
+        total_bytes = (bitwidth * total_weights) / 8
+        return total_bytes
+
+    def forward(self, x):
+        weight = self.weight
+        pad_rows = self.num_tiles_row * self.tile_size - self.out_features
+        pad_cols = self.num_tiles_col * self.tile_size - self.in_features
+        if pad_rows > 0 or pad_cols > 0:
+            weight_padded = F.pad(weight, (0, pad_cols, 0, pad_rows))
+        else:
+            weight_padded = weight
+
+        #(num_tiles_row, tile_size, num_tiles_col, tile_size)
+        weight_tiles = weight_padded.view(self.num_tiles_row, self.tile_size,
+                                          self.num_tiles_col, self.tile_size)
+        #(num_tiles_row, num_tiles_col, tile_size, tile_size)
+        weight_tiles = weight_tiles.permute(0, 2, 1, 3)
+        
+        
+        #(num_tiles_row, num_tiles_col, 1, 1)
+        e_exp = self.e.unsqueeze(-1).unsqueeze(-1)
+        b_exp = self.b.unsqueeze(-1).unsqueeze(-1)
+        
+        quantized_tiles = self.quantizer(weight_tiles, e_exp, b_exp)
+        
+        quantized_weight_padded = quantized_tiles.permute(0, 2, 1, 3).contiguous().view(
+            self.num_tiles_row * self.tile_size, self.num_tiles_col * self.tile_size
+        )
+        quantized_weight = quantized_weight_padded[:self.out_features, :self.in_features].to(self.device)
+        
+        return F.linear(x, quantized_weight)
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -111,9 +169,9 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = QLinearPerChannel(config.n_embd, 3 * config.n_embd)
+        self.c_attn = QLinearTile2D(config.n_embd, 3 * config.n_embd)
         # output projection
-        self.c_proj = QLinearPerChannel(config.n_embd, config.n_embd)
+        self.c_proj = QLinearTile2D(config.n_embd, config.n_embd)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -158,9 +216,9 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = QLinearPerChannel(config.n_embd, 4 * config.n_embd)
+        self.c_fc    = QLinearTile2D(config.n_embd, 4 * config.n_embd)
         self.gelu    = nn.GELU()
-        self.c_proj  = QLinearPerChannel(4 * config.n_embd, config.n_embd)
+        self.c_proj  = QLinearTile2D(4 * config.n_embd, config.n_embd)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):

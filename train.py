@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT, QLinearPerChannel
+from model import GPTConfig, GPT, QLinearPerChannel, QLinearTile2D
 import pandas as pd
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -201,21 +201,12 @@ def compute_model_bytes(model):
             total_bytes += module.calculate_nbytes()
     return total_bytes
 
-def compute_model_sparsity(model, eps=1e-6):
-    total_sparsity = 0.0
-    count = 0
-    for module in model.modules():
-        if hasattr(module, "calculate_sparsity"):
-            total_sparsity += module.calculate_sparsity(eps=eps)
-            count += 1
-    return total_sparsity / count if count > 0 else 0.0
-
 def compute_avg_qbits(model):
     total_q = 0.0
     total_params_with_q = 0
 
     for module in model.modules():
-        if isinstance(module, QLinearPerChannel):
+        if isinstance(module, (QLinearPerChannel, QLinearTile2D)):
             avg_qbits = module.qbits()
             nparams = module.weight.numel()
             total_q += avg_qbits * nparams
@@ -228,7 +219,7 @@ def compute_avg_qbits(model):
 def total_quant_params(model):
     total_params = 0
     for module in model.modules():
-        if isinstance(module, QLinearPerChannel):
+        if isinstance(module, (QLinearPerChannel, QLinearTile2D)):
             total_params += module.weight.numel()
     return total_params
 
@@ -316,7 +307,6 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        model_sparsity = compute_model_sparsity(raw_model)
         model_size = compute_model_bytes(raw_model).item()  # current bytes
         compression_rate = model_size / base_model_size
         avg_qbits = compute_avg_qbits(raw_model).item()
@@ -370,7 +360,7 @@ while True:
 
             Q = 0.0
             for layer in model.modules():
-                if isinstance(layer, QLinearPerChannel):
+                if isinstance(layer, (QLinearPerChannel, QLinearTile2D)):
                     layer_params = layer.weight.numel() if hasattr(layer, "weight") else 1
                     Q += (layer.qbits() * layer_params) / total_params
                     
@@ -398,7 +388,7 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         lossf = loss.item() * gradient_accumulation_steps
-        model_size = compute_model_bytes(raw_model)
+        model_size = compute_model_bytes(raw_model).item()
         compression_rate = model_size / base_model_size
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
