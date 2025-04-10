@@ -39,17 +39,13 @@ class QLinearPerChannel(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         
-        self.num_tiles_col = 1
-        
-        self.tile_size = math.ceil(in_features / self.num_tiles_col)
-        
         scale = 1 / math.sqrt(in_features)
         self.weight = nn.Parameter(
             torch.FloatTensor(out_features, in_features).uniform_(-scale, scale)
         )
 
-        self.e = nn.Parameter(torch.full((out_features, self.num_tiles_col), -8.))
-        self.b = nn.Parameter(torch.full((out_features, self.num_tiles_col),  4.))
+        self.e = nn.Parameter(torch.full((out_features, 1), -8.))
+        self.b = nn.Parameter(torch.full((out_features, 1),  4.))
 
         self.quantizer = Quantizer()
 
@@ -73,25 +69,7 @@ class QLinearPerChannel(nn.Module):
         return total_bytes
 
     def forward(self, x):
-        weight = self.weight
-
-        total_cols = self.num_tiles_col * self.tile_size
-        pad_cols = total_cols - self.in_features
-        if pad_cols > 0:
-            weight_padded = F.pad(weight, (0, pad_cols, 0, 0))
-        else:
-            weight_padded = weight
-        
-        weight_tiles = weight_padded.view(self.out_features, self.num_tiles_col, self.tile_size)
-
-        e_exp = self.e.unsqueeze(-1)
-        b_exp = self.b.unsqueeze(-1)
-
-        quantized_tiles = self.quantizer(weight_tiles, e_exp, b_exp)
-
-        quantized_weight_padded = quantized_tiles.view(self.out_features, total_cols)
-        quantized_weight = quantized_weight_padded[:, :self.in_features].to(self.device)
-        
+        quantized_weight = self.quantizer(self.weight, self.e, self.b)
         return F.linear(x, quantized_weight)
     
 class QLinearTile2D(nn.Module):

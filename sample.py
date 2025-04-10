@@ -6,7 +6,10 @@ import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, QLinearPerChannel, QLinearTile2D
+import torch.nn as nn
+import torch.nn.functional as F
+import math
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
@@ -23,6 +26,85 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
+def inspect_and_save_quantization(layer: nn.Module, name="layer", save_dir="inspect_out"):
+    import os, matplotlib.pyplot as plt
+    os.makedirs(save_dir, exist_ok=True)
+
+    with torch.no_grad():
+        raw_weight = layer.weight.detach().cpu()
+
+        if isinstance(layer, QLinearPerChannel):
+            e = layer.e.detach().cpu()
+            b = layer.b.detach().cpu()
+            quantized_weight = layer.quantizer(raw_weight, e, b)
+
+            # Sparsity map: b == 0 per output channel
+            sparsity_map = (F.relu(b) == 0).float().view(-1, 1) @ torch.ones(1, raw_weight.shape[1])
+
+        elif isinstance(layer, QLinearTile2D):
+            e = layer.e.detach().cpu()
+            b = layer.b.detach().cpu()
+            out_features = layer.out_features
+            in_features = layer.in_features
+            tile_size = layer.tile_size
+
+            # Compute how much padding is applied
+            num_tiles_row = math.ceil(out_features / tile_size)
+            num_tiles_col = math.ceil(in_features / tile_size)
+            padded_rows = num_tiles_row * tile_size
+            padded_cols = num_tiles_col * tile_size
+
+            # Pad weights manually for tiling
+            pad_rows = padded_rows - out_features
+            pad_cols = padded_cols - in_features
+            weight_padded = F.pad(raw_weight, (0, pad_cols, 0, pad_rows))
+            weight_tiles = weight_padded.view(num_tiles_row, tile_size,
+                                              num_tiles_col, tile_size).permute(0, 2, 1, 3)
+
+            e_exp = e.unsqueeze(-1).unsqueeze(-1)
+            b_exp = b.unsqueeze(-1).unsqueeze(-1)
+            quantized_tiles = layer.quantizer(weight_tiles, e_exp, b_exp)
+
+            quantized_weight_padded = quantized_tiles.permute(0, 2, 1, 3).contiguous().view(
+                padded_rows, padded_cols
+            )
+            quantized_weight = quantized_weight_padded[:out_features, :in_features]
+
+            # Create tile-wise sparsity mask (b == 0)
+            tile_mask = (F.relu(b) == 0).float()
+            full_mask = tile_mask.repeat_interleave(tile_size, dim=0).repeat_interleave(tile_size, dim=1)
+            sparsity_map = full_mask[:out_features, :in_features]
+
+        else:
+            raise ValueError(f"Unsupported layer type: {type(layer)}")
+
+        # Save raw data
+        torch.save(raw_weight, f"{save_dir}/{name}_raw.pt")
+        torch.save(quantized_weight, f"{save_dir}/{name}_quantized.pt")
+        torch.save(b, f"{save_dir}/{name}_b.pt")
+
+        # Plot
+        fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+        axs[0].imshow(raw_weight, aspect='auto', cmap='bwr')
+        axs[0].set_title("Raw Weight")
+
+        axs[1].imshow(quantized_weight, aspect='auto', cmap='bwr')
+        axs[1].set_title("Quantized Weight")
+
+        axs[2].imshow(sparsity_map, cmap='Greys', aspect='auto')
+        axs[2].set_title(f"Sparsity Map (b == 0)\nSparsity: {(sparsity_map.sum() / sparsity_map.numel()):.2%}")
+
+        for ax in axs:
+            ax.set_xlabel("In Features")
+            ax.set_ylabel("Out Features")
+
+        plt.tight_layout()
+        plt.savefig(f"{save_dir}/{name}_viz.png")
+        plt.close()
+
+        print(f"[{name}] Quantization inspection saved in: {save_dir}")
+
+
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
@@ -34,7 +116,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # model
 if init_from == 'resume':
     # init from a model saved in a specific directory
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt_path = os.path.join(out_dir, 'ckpt_tiled.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     gptconf = GPTConfig(**checkpoint['model_args'])
     model = GPT(gptconf)
@@ -52,6 +134,10 @@ model.eval()
 model.to(device)
 if compile:
     model = torch.compile(model) # requires PyTorch 2.0 (optional)
+
+for name, module in model.named_modules():
+    if isinstance(module, (QLinearPerChannel, QLinearTile2D)):
+        inspect_and_save_quantization(module, name=name.replace('.', '_'))
 
 # look for the meta pickle in case it is available in the dataset folder
 load_meta = False
