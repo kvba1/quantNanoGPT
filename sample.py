@@ -26,6 +26,40 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
+class QLinearTile2D_BSR(torch.nn.Module):
+    def __init__(self, old: QLinearTile2D):
+        super().__init__()
+        self.out_features = old.out_features
+        self.in_features = old.in_features
+        self.tile_size = old.tile_size
+
+        # 1a) Kwantyzacja dokładnie jak w forward()
+        weight = old.weight.detach().cpu()
+        R, C, TS = old.num_tiles_row, old.num_tiles_col, self.tile_size
+        pad_rows = R*TS - self.out_features
+        pad_cols = C*TS - self.in_features
+        wp = F.pad(weight, (0, pad_cols, 0, pad_rows))
+        tiles = wp.view(R, TS, C, TS).permute(0,2,1,3)
+        e = old.e.detach().cpu().unsqueeze(-1).unsqueeze(-1)
+        b = old.b.detach().cpu().unsqueeze(-1).unsqueeze(-1)
+        qt = old.quantizer(tiles, e, b)
+        qp = qt.permute(0,2,1,3).contiguous().view(R*TS, C*TS)
+        q  = qp[:self.out_features, :self.in_features]
+
+        # 1b) Konwersja do BSR
+        self.weight_bsr = q.to_sparse_bsr(blocksize=(TS,TS)).to(old.weight.device)
+
+    def forward(self, x):
+        # obsłuż [B, T, C] i [B, C]
+        if x.dim()==3:
+            B, T, C = x.shape
+            x2 = x.reshape(-1, C)
+            y_t = torch.sparse.mm(self.weight_bsr, x2.t())
+            return y_t.t().view(B, T, -1)
+        else:
+            y_t = torch.sparse.mm(self.weight_bsr, x.t())
+            return y_t.t()
+
 def inspect_and_save_quantization(layer: nn.Module, name="layer", save_dir="inspect_out"):
     import os, matplotlib.pyplot as plt
     os.makedirs(save_dir, exist_ok=True)
@@ -132,6 +166,17 @@ elif init_from.startswith('gpt2'):
 
 model.eval()
 model.to(device)
+
+# 2) Funkcja rekurencyjnie zastępująca moduły
+def replace_qlinear_tiles(module):
+    for name, child in list(module.named_children()):
+        if isinstance(child, QLinearTile2D):
+            setattr(module, name, QLinearTile2D_BSR(child))
+
+model_sparse = GPT(cfg).eval().to(device)
+model_sparse.load_state_dict(model.state_dict(), strict=False)
+replace_qlinear_tiles(model_sparse)
+
 if compile:
     model = torch.compile(model) # requires PyTorch 2.0 (optional)
 
