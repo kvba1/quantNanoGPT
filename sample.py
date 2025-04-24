@@ -10,6 +10,8 @@ from model import GPTConfig, GPT, QLinearPerChannel, QLinearTile2D
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import time
+import copy
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
@@ -26,6 +28,33 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
+def bench_forward(model, name: str, x, ctx, warmup: int = 10, steps: int = 50):
+    model.eval()
+    torch.cuda.synchronize()
+    # warmup
+    with torch.no_grad(), ctx:
+        for _ in range(warmup):
+            _ = model(x)
+
+    torch.cuda.synchronize()
+
+    t0 = time.time()
+    with torch.no_grad(), ctx:
+        for _ in range(steps):
+            _ = model(x)
+    torch.cuda.synchronize()
+    t1 = time.time()
+
+    ms = (t1 - t0) / steps * 1000
+    # Optional MFU if the helper exists
+    if hasattr(model, "estimate_mfu"):
+        tokens = x.numel() * steps            # tokens processed
+        mfu = model.estimate_mfu(tokens, t1 - t0) * 100
+        print(f"[{name}] {ms:7.2f} ms/iter | MFU {mfu:5.2f}%")
+    else:
+        print(f"[{name}] {ms:7.2f} ms/iter")
+    return ms
+
 class QLinearTile2D_BSR(torch.nn.Module):
     def __init__(self, old: QLinearTile2D):
         super().__init__()
@@ -33,24 +62,21 @@ class QLinearTile2D_BSR(torch.nn.Module):
         self.in_features = old.in_features
         self.tile_size = old.tile_size
 
-        # 1a) Kwantyzacja dokładnie jak w forward()
-        weight = old.weight.detach().cpu()
+        weight = old.weight.detach()
         R, C, TS = old.num_tiles_row, old.num_tiles_col, self.tile_size
         pad_rows = R*TS - self.out_features
         pad_cols = C*TS - self.in_features
         wp = F.pad(weight, (0, pad_cols, 0, pad_rows))
         tiles = wp.view(R, TS, C, TS).permute(0,2,1,3)
-        e = old.e.detach().cpu().unsqueeze(-1).unsqueeze(-1)
-        b = old.b.detach().cpu().unsqueeze(-1).unsqueeze(-1)
+        e = old.e.detach().unsqueeze(-1).unsqueeze(-1)
+        b = old.b.detach().unsqueeze(-1).unsqueeze(-1)
         qt = old.quantizer(tiles, e, b)
         qp = qt.permute(0,2,1,3).contiguous().view(R*TS, C*TS)
         q  = qp[:self.out_features, :self.in_features]
 
-        # 1b) Konwersja do BSR
         self.weight_bsr = q.to_sparse_bsr(blocksize=(TS,TS)).to(old.weight.device)
 
     def forward(self, x):
-        # obsłuż [B, T, C] i [B, C]
         if x.dim()==3:
             B, T, C = x.shape
             x2 = x.reshape(-1, C)
@@ -59,6 +85,27 @@ class QLinearTile2D_BSR(torch.nn.Module):
         else:
             y_t = torch.sparse.mm(self.weight_bsr, x.t())
             return y_t.t()
+
+def replace_qlinear_tiles(module, sparsity_threshold: float = 0.75):
+    """
+    Recursively walk `module`; turn a QLinearTile2D into the sparse-BSR variant
+    only when more than `sparsity_threshold` of its tiles are zero
+    (i.e. b == 0 from the quantizer).
+    """
+    for name, child in list(module.named_children()):
+        if isinstance(child, QLinearTile2D):
+            with torch.no_grad():
+                # tile is pruned when b == 0  (see inspect helper above)
+                mask_zero = (F.relu(child.b) == 0)
+                sparsity  = mask_zero.float().mean().item()          # tile-level %
+            if sparsity > sparsity_threshold:
+                setattr(module, name, QLinearTile2D_BSR(child))
+                print(f"[sparse] {name}  sparsity={sparsity:.2%} to  BSR")
+            else:
+                print(f"[dense ] {name}  sparsity={sparsity:.2%}  (kept)")
+        else:
+            replace_qlinear_tiles(child, sparsity_threshold)
+
 
 def inspect_and_save_quantization(layer: nn.Module, name="layer", save_dir="inspect_out"):
     import os, matplotlib.pyplot as plt
@@ -82,13 +129,11 @@ def inspect_and_save_quantization(layer: nn.Module, name="layer", save_dir="insp
             in_features = layer.in_features
             tile_size = layer.tile_size
 
-            # Compute how much padding is applied
             num_tiles_row = math.ceil(out_features / tile_size)
             num_tiles_col = math.ceil(in_features / tile_size)
             padded_rows = num_tiles_row * tile_size
             padded_cols = num_tiles_col * tile_size
 
-            # Pad weights manually for tiling
             pad_rows = padded_rows - out_features
             pad_cols = padded_cols - in_features
             weight_padded = F.pad(raw_weight, (0, pad_cols, 0, pad_rows))
@@ -104,7 +149,6 @@ def inspect_and_save_quantization(layer: nn.Module, name="layer", save_dir="insp
             )
             quantized_weight = quantized_weight_padded[:out_features, :in_features]
 
-            # Create tile-wise sparsity mask (b == 0)
             tile_mask = (F.relu(b) == 0).float()
             full_mask = tile_mask.repeat_interleave(tile_size, dim=0).repeat_interleave(tile_size, dim=1)
             sparsity_map = full_mask[:out_features, :in_features]
@@ -164,25 +208,20 @@ elif init_from.startswith('gpt2'):
     # init from a given GPT-2 model
     model = GPT.from_pretrained(init_from, dict(dropout=0.0))
 
-model.eval()
-model.to(device)
-
-# 2) Funkcja rekurencyjnie zastępująca moduły
-def replace_qlinear_tiles(module):
-    for name, child in list(module.named_children()):
-        if isinstance(child, QLinearTile2D):
-            setattr(module, name, QLinearTile2D_BSR(child))
-
-model_sparse = GPT(cfg).eval().to(device)
-model_sparse.load_state_dict(model.state_dict(), strict=False)
-replace_qlinear_tiles(model_sparse)
-
-if compile:
-    model = torch.compile(model) # requires PyTorch 2.0 (optional)
+model.eval().to(device)
 
 for name, module in model.named_modules():
     if isinstance(module, (QLinearPerChannel, QLinearTile2D)):
         inspect_and_save_quantization(module, name=name.replace('.', '_'))
+
+model_sparse = copy.deepcopy(model)
+replace_qlinear_tiles(model_sparse)
+# print(model_sparse)
+# print(model_sparse.transformer.h[4].mlp.c_fc.weight_bsr)
+# print(model_sparse.transformer.h[4].mlp.c_proj.weight_bsr)
+
+if compile:
+    model = torch.compile(model) # requires PyTorch 2.0 (optional)
 
 # look for the meta pickle in case it is available in the dataset folder
 load_meta = False
@@ -211,10 +250,14 @@ if start.startswith('FILE:'):
 start_ids = encode(start)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
+dense_ms  = bench_forward(model,        "Dense",  x, ctx)
+sparse_ms = bench_forward(model_sparse, "Sparse", x, ctx)
+print(f"Speed-up: {dense_ms/sparse_ms:5.2f}×")
+
 # run generation
 with torch.no_grad():
     with ctx:
         for k in range(num_samples):
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+            y = model_sparse.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
             print(decode(y[0].tolist()))
             print('---------------')
