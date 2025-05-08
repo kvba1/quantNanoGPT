@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import math
 import time
 import copy
+import os, matplotlib.pyplot as plt
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
@@ -46,7 +47,6 @@ def bench_forward(model, name: str, x, ctx, warmup: int = 10, steps: int = 50):
     t1 = time.time()
 
     ms = (t1 - t0) / steps * 1000
-    # Optional MFU if the helper exists
     if hasattr(model, "estimate_mfu"):
         tokens = x.numel() * steps            # tokens processed
         mfu = model.estimate_mfu(tokens, t1 - t0) * 100
@@ -107,80 +107,123 @@ def replace_qlinear_tiles(module, sparsity_threshold: float = 0.75):
             replace_qlinear_tiles(child, sparsity_threshold)
 
 
-def inspect_and_save_quantization(layer: nn.Module, name="layer", save_dir="inspect_out"):
-    import os, matplotlib.pyplot as plt
+def inspect_and_save_quantization(layer: torch.nn.Module,
+                                  name: str = "layer",
+                                  save_dir: str = "inspect_out",
+                                  n_heads: int = 6):
+    """
+    Inspect and save quantization plots for QLinearPerChannel and QLinearTile2D layers.
+    If the layer name contains 'c_attn', additionally split its weight into Q/K/V and plot
+    each separately, including per-head visualizations.
+    """
     os.makedirs(save_dir, exist_ok=True)
 
     with torch.no_grad():
+        # 1) Extract raw weight tensor
         raw_weight = layer.weight.detach().cpu()
 
+        # 2) Quantize and build sparsity map
         if isinstance(layer, QLinearPerChannel):
             e = layer.e.detach().cpu()
             b = layer.b.detach().cpu()
             quantized_weight = layer.quantizer(raw_weight, e, b)
-
-            # Sparsity map: b == 0 per output channel
-            sparsity_map = (F.relu(b) == 0).float().view(-1, 1) @ torch.ones(1, raw_weight.shape[1])
+            sparsity_map = (F.relu(b) == 0).float().view(-1, 1) @ \
+                           torch.ones(1, raw_weight.shape[1])
 
         elif isinstance(layer, QLinearTile2D):
             e = layer.e.detach().cpu()
             b = layer.b.detach().cpu()
-            out_features = layer.out_features
-            in_features = layer.in_features
-            tile_size = layer.tile_size
+            out_f, in_f, ts = layer.out_features, layer.in_features, layer.tile_size
 
-            num_tiles_row = math.ceil(out_features / tile_size)
-            num_tiles_col = math.ceil(in_features / tile_size)
-            padded_rows = num_tiles_row * tile_size
-            padded_cols = num_tiles_col * tile_size
-
-            pad_rows = padded_rows - out_features
-            pad_cols = padded_cols - in_features
-            weight_padded = F.pad(raw_weight, (0, pad_cols, 0, pad_rows))
-            weight_tiles = weight_padded.view(num_tiles_row, tile_size,
-                                              num_tiles_col, tile_size).permute(0, 2, 1, 3)
-
+            R = math.ceil(out_f / ts)
+            C_ = math.ceil(in_f  / ts)
+            pad_r = R*ts - out_f
+            pad_c = C_*ts - in_f
+            wp = F.pad(raw_weight, (0, pad_c, 0, pad_r))
+            tiles = wp.view(R, ts, C_, ts).permute(0,2,1,3)
             e_exp = e.unsqueeze(-1).unsqueeze(-1)
             b_exp = b.unsqueeze(-1).unsqueeze(-1)
-            quantized_tiles = layer.quantizer(weight_tiles, e_exp, b_exp)
-
-            quantized_weight_padded = quantized_tiles.permute(0, 2, 1, 3).contiguous().view(
-                padded_rows, padded_cols
-            )
-            quantized_weight = quantized_weight_padded[:out_features, :in_features]
+            qt = layer.quantizer(tiles, e_exp, b_exp)
+            qp = qt.permute(0,2,1,3).contiguous().view(R*ts, C_*ts)
+            quantized_weight = qp[:out_f, :in_f]
 
             tile_mask = (F.relu(b) == 0).float()
-            full_mask = tile_mask.repeat_interleave(tile_size, dim=0).repeat_interleave(tile_size, dim=1)
-            sparsity_map = full_mask[:out_features, :in_features]
+            sparsity_map = tile_mask.repeat_interleave(ts, dim=0) \
+                                .repeat_interleave(ts, dim=1)
+            sparsity_map = sparsity_map[:out_f, :in_f]
 
         else:
             raise ValueError(f"Unsupported layer type: {type(layer)}")
 
-        # Save raw data
-        torch.save(raw_weight, f"{save_dir}/{name}_raw.pt")
-        torch.save(quantized_weight, f"{save_dir}/{name}_quantized.pt")
-        torch.save(b, f"{save_dir}/{name}_b.pt")
+        # 3) Save raw and quantized weights (and b, if present)
+        safe_name = name.replace('.', '_')
+        torch.save(raw_weight,         f"{save_dir}/{safe_name}_raw.pt")
+        torch.save(quantized_weight,   f"{save_dir}/{safe_name}_quantized.pt")
+        if hasattr(layer, 'b'):
+            torch.save(layer.b.detach().cpu(), f"{save_dir}/{safe_name}_b.pt")
 
-        # Plot
+        # 4) Plot full raw vs quantized vs sparsity
         fig, axs = plt.subplots(1, 3, figsize=(18, 5))
-        axs[0].imshow(raw_weight, aspect='auto', cmap='bwr')
-        axs[0].set_title("Raw Weight")
-
+        axs[0].imshow(raw_weight,       aspect='auto', cmap='bwr')
+        axs[0].set_title("Raw Weight (3·C × C)")
         axs[1].imshow(quantized_weight, aspect='auto', cmap='bwr')
         axs[1].set_title("Quantized Weight")
-
-        axs[2].imshow(sparsity_map, cmap='Greys', aspect='auto')
-        axs[2].set_title(f"Sparsity Map (b == 0)\nSparsity: {(sparsity_map.sum() / sparsity_map.numel()):.2%}")
-
+        axs[2].imshow(sparsity_map,     aspect='auto', cmap='Greys')
+        axs[2].set_title(f"Sparsity Map (b==0): {(sparsity_map.mean()*100):.2f}%")
         for ax in axs:
             ax.set_xlabel("In Features")
             ax.set_ylabel("Out Features")
-
         plt.tight_layout()
-        plt.savefig(f"{save_dir}/{name}_viz.png")
+        plt.savefig(f"{save_dir}/{safe_name}_full_viz.png")
         plt.close()
 
-        print(f"[{name}] Quantization inspection saved in: {save_dir}")
+        # If not an attention layer, we’re done
+        if 'c_attn' not in name:
+            print(f"[{name}] Quantization inspection saved in: {save_dir}")
+            return
+
+        # 5) For c_attn layers: split into Q/K/V and re-plot
+        C = raw_weight.shape[1]
+        splits = raw_weight.split(C, dim=0)
+        q_raw, k_raw, v_raw = splits
+        q_quant, k_quant, v_quant = quantized_weight.split(C, dim=0)
+        q_mask, k_mask, v_mask     = sparsity_map.split(C, dim=0)
+
+        for label, R, Q_, M in zip(
+            ['Q','K','V'],
+            [q_raw, k_raw, v_raw],
+            [q_quant, k_quant, v_quant],
+            [q_mask, k_mask, v_mask],
+        ):
+            fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+            axs[0].imshow(R,  aspect='auto', cmap='bwr')
+            axs[0].set_title(f"{label} Raw (C × C)")
+            axs[1].imshow(Q_, aspect='auto', cmap='bwr')
+            axs[1].set_title(f"{label} Quant")
+            axs[2].imshow(M,  aspect='auto', cmap='Greys')
+            axs[2].set_title(f"{label} Mask: {(M.mean()*100):.2f}%")
+            for ax in axs:
+                ax.set_xlabel("In Features")
+                ax.set_ylabel("Out Features")
+            plt.tight_layout()
+            plt.savefig(f"{save_dir}/{safe_name}_{label}_viz.png")
+            plt.close()
+
+        # 6) Per-head visualizations
+        head_dim = C // n_heads
+        for label, tensor in [('Q', q_raw), ('K', k_raw), ('V', v_raw)]:
+            heads = tensor.view(n_heads, head_dim, C)
+            for h in range(n_heads):
+                fig, ax = plt.subplots(figsize=(5, 4))
+                ax.imshow(heads[h], aspect='auto')
+                ax.set_title(f"{safe_name} • {label} Head {h}")
+                ax.set_xlabel("In Features")
+                ax.set_ylabel("Head Dim")
+                plt.tight_layout()
+                plt.savefig(f"{save_dir}/{safe_name}_{label}_head{h}.png")
+                plt.close()
+
+        print(f"[{name}] All c_attn quantization and head plots saved in: {save_dir}")
 
 
 torch.manual_seed(seed)
