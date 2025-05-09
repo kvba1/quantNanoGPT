@@ -119,10 +119,8 @@ def inspect_and_save_quantization(layer: torch.nn.Module,
     os.makedirs(save_dir, exist_ok=True)
 
     with torch.no_grad():
-        # 1) Extract raw weight tensor
         raw_weight = layer.weight.detach().cpu()
 
-        # 2) Quantize and build sparsity map
         if isinstance(layer, QLinearPerChannel):
             e = layer.e.detach().cpu()
             b = layer.b.detach().cpu()
@@ -155,14 +153,12 @@ def inspect_and_save_quantization(layer: torch.nn.Module,
         else:
             raise ValueError(f"Unsupported layer type: {type(layer)}")
 
-        # 3) Save raw and quantized weights (and b, if present)
         safe_name = name.replace('.', '_')
         torch.save(raw_weight,         f"{save_dir}/{safe_name}_raw.pt")
         torch.save(quantized_weight,   f"{save_dir}/{safe_name}_quantized.pt")
         if hasattr(layer, 'b'):
             torch.save(layer.b.detach().cpu(), f"{save_dir}/{safe_name}_b.pt")
 
-        # 4) Plot full raw vs quantized vs sparsity
         fig, axs = plt.subplots(1, 3, figsize=(18, 5))
         axs[0].imshow(raw_weight,       aspect='auto', cmap='bwr')
         axs[0].set_title("Raw Weight (3·C × C)")
@@ -177,12 +173,10 @@ def inspect_and_save_quantization(layer: torch.nn.Module,
         plt.savefig(f"{save_dir}/{safe_name}_full_viz.png")
         plt.close()
 
-        # If not an attention layer, we’re done
         if 'c_attn' not in name:
             print(f"[{name}] Quantization inspection saved in: {save_dir}")
             return
-
-        # 5) For c_attn layers: split into Q/K/V and re-plot
+        
         C = raw_weight.shape[1]
         splits = raw_weight.split(C, dim=0)
         q_raw, k_raw, v_raw = splits
@@ -208,20 +202,6 @@ def inspect_and_save_quantization(layer: torch.nn.Module,
             plt.tight_layout()
             plt.savefig(f"{save_dir}/{safe_name}_{label}_viz.png")
             plt.close()
-
-        # 6) Per-head visualizations
-        head_dim = C // n_heads
-        for label, tensor in [('Q', q_raw), ('K', k_raw), ('V', v_raw)]:
-            heads = tensor.view(n_heads, head_dim, C)
-            for h in range(n_heads):
-                fig, ax = plt.subplots(figsize=(5, 4))
-                ax.imshow(heads[h], aspect='auto')
-                ax.set_title(f"{safe_name} • {label} Head {h}")
-                ax.set_xlabel("In Features")
-                ax.set_ylabel("Head Dim")
-                plt.tight_layout()
-                plt.savefig(f"{save_dir}/{safe_name}_{label}_head{h}.png")
-                plt.close()
 
         print(f"[{name}] All c_attn quantization and head plots saved in: {save_dir}")
 
