@@ -90,9 +90,8 @@ def replace_qlinear_tiles(module, sparsity_threshold: float = 0.75):
     for name, child in list(module.named_children()):
         if isinstance(child, QLinearTile2D):
             with torch.no_grad():
-                # tile is pruned when b == 0  (see inspect helper above)
                 mask_zero = (F.relu(child.b) == 0)
-                sparsity  = mask_zero.float().mean().item()          # tile-level %
+                sparsity  = mask_zero.float().mean().item()          # sparsity % in a layer
             if sparsity > sparsity_threshold:
                 setattr(module, name, QLinearTile2D_BSR(child))
                 print(f"[sparse] {name}  sparsity={sparsity:.2%} to  BSR")
