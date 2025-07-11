@@ -87,11 +87,6 @@ class QLinearTile2D_BSR(torch.nn.Module):
             return y_t.t()
 
 def replace_qlinear_tiles(module, sparsity_threshold: float = 0.75):
-    """
-    Recursively walk `module`; turn a QLinearTile2D into the sparse-BSR variant
-    only when more than `sparsity_threshold` of its tiles are zero
-    (i.e. b == 0 from the quantizer).
-    """
     for name, child in list(module.named_children()):
         if isinstance(child, QLinearTile2D):
             with torch.no_grad():
@@ -111,11 +106,6 @@ def inspect_and_save_quantization(layer: torch.nn.Module,
                                   name: str = "layer",
                                   save_dir: str = "inspect_out",
                                   n_heads: int = 6):
-    """
-    Inspect and save quantization plots for QLinearPerChannel and QLinearTile2D layers.
-    If the layer name contains 'c_attn', additionally split its weight into Q/K/V and plot
-    each separately, including per-head visualizations.
-    """
     os.makedirs(save_dir, exist_ok=True)
 
     with torch.no_grad():
@@ -173,36 +163,18 @@ def inspect_and_save_quantization(layer: torch.nn.Module,
         plt.savefig(f"{save_dir}/{safe_name}_full_viz.png")
         plt.close()
 
+        plt.figure(figsize=(6, 4))
+        plt.hist(quantized_weight.flatten().numpy(), bins=100)
+        plt.title("Histogram of Quantized Weights")
+        plt.xlabel("Value")
+        plt.ylabel("Frequency")
+        plt.tight_layout()
+        plt.savefig(f"{save_dir}/{name.replace('.', '_')}_hist.png")
+        plt.close()
+
         if 'c_attn' not in name:
             print(f"[{name}] Quantization inspection saved in: {save_dir}")
             return
-        
-        C = raw_weight.shape[1]
-        splits = raw_weight.split(C, dim=0)
-        q_raw, k_raw, v_raw = splits
-        q_quant, k_quant, v_quant = quantized_weight.split(C, dim=0)
-        q_mask, k_mask, v_mask     = sparsity_map.split(C, dim=0)
-
-        for label, R, Q_, M in zip(
-            ['Q','K','V'],
-            [q_raw, k_raw, v_raw],
-            [q_quant, k_quant, v_quant],
-            [q_mask, k_mask, v_mask],
-        ):
-            fig, axs = plt.subplots(1, 3, figsize=(18, 5))
-            axs[0].imshow(R,  aspect='auto', cmap='bwr')
-            axs[0].set_title(f"{label} Raw (C × C)")
-            axs[1].imshow(Q_, aspect='auto', cmap='bwr')
-            axs[1].set_title(f"{label} Quant")
-            axs[2].imshow(M,  aspect='auto', cmap='Greys')
-            axs[2].set_title(f"{label} Mask: {(M.mean()*100):.2f}%")
-            for ax in axs:
-                ax.set_xlabel("In Features")
-                ax.set_ylabel("Out Features")
-            plt.tight_layout()
-            plt.savefig(f"{save_dir}/{safe_name}_{label}_viz.png")
-            plt.close()
-
         print(f"[{name}] All c_attn quantization and head plots saved in: {save_dir}")
 
 
