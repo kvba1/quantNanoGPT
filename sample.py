@@ -55,6 +55,56 @@ def bench_forward(model, name: str, x, ctx, warmup: int = 10, steps: int = 50):
         print(f"[{name}] {ms:7.2f} ms/iter")
     return ms
 
+def tensor_stats(t: torch.Tensor):
+    flat = t.view(-1).float()
+    numel = flat.numel()
+    nz_cnt = torch.count_nonzero(flat).item()
+    def near_zero(th): return int((flat.abs() < th).sum())
+    return {
+        "shape": list(t.shape),
+        "min": flat.min().item(),
+        "max": flat.max().item(),
+        "mean": flat.mean().item(),
+        "std": flat.std(unbiased=False).item(),
+        "sparsity": 1.0 - nz_cnt / numel,
+        "zero_count": int(numel - nz_cnt),
+        "near_zero_1e3_count": near_zero(1e-3),
+        "near_zero_1e4_count": near_zero(1e-4),
+        "near_zero_1e5_count": near_zero(1e-5),
+        "potential_sparsity_1e3": near_zero(1e-3) / numel,
+        "potential_sparsity_1e4": near_zero(1e-4) / numel,
+        "potential_sparsity_1e5": near_zero(1e-5) / numel,
+    }
+	
+def _quantize_qlinear_per_channel(layer: QLinearPerChannel):
+    with torch.no_grad():
+        e = layer.e.detach()
+        b = layer.b.detach()
+        q_weight = layer.quantizer(layer.weight, e.unsqueeze(-1), b.unsqueeze(-1))
+        layer.weight.copy_(q_weight)
+
+def _quantize_qlinear_tile2d(layer: QLinearTile2D):
+    with torch.no_grad():
+        out_f, in_f, ts = layer.out_features, layer.in_features, layer.tile_size
+        R, C_ = math.ceil(out_f / ts), math.ceil(in_f / ts)
+        pad_r, pad_c = R * ts - out_f, C_ * ts - in_f
+        wp = F.pad(layer.weight, (0, pad_c, 0, pad_r))
+        tiles = wp.view(R, ts, C_, ts).permute(0, 2, 1, 3)
+        e = layer.e.detach().unsqueeze(-1).unsqueeze(-1)
+        b = layer.b.detach().unsqueeze(-1).unsqueeze(-1)
+        qt = layer.quantizer(tiles, e, b)
+        qp = qt.permute(0, 2, 1, 3).contiguous().view(R * ts, C_ * ts)
+        q_weight = qp[:out_f, :in_f]
+        layer.weight.copy_(q_weight)
+
+def quantize_model_weights(model: torch.nn.Module):
+    for name, mod in model.named_modules():
+        if isinstance(mod, QLinearPerChannel):
+            _quantize_qlinear_per_channel(mod)
+        elif isinstance(mod, QLinearTile2D):
+            _quantize_qlinear_tile2d(mod)
+    return model
+
 class QLinearTile2D_BSR(torch.nn.Module):
     def __init__(self, old: QLinearTile2D):
         super().__init__()
@@ -133,7 +183,7 @@ def inspect_and_save_quantization(layer: torch.nn.Module,
             qt = layer.quantizer(tiles, e_exp, b_exp)
             qp = qt.permute(0,2,1,3).contiguous().view(R*ts, C_*ts)
             quantized_weight = qp[:out_f, :in_f]
-
+            print(tensor_stats(quantized_weight))
             tile_mask = (F.relu(b) == 0).float()
             sparsity_map = tile_mask.repeat_interleave(ts, dim=0) \
                                 .repeat_interleave(ts, dim=1)
@@ -207,6 +257,25 @@ model.eval().to(device)
 for name, module in model.named_modules():
     if isinstance(module, (QLinearPerChannel, QLinearTile2D)):
         inspect_and_save_quantization(module, name=name.replace('.', '_'))
+
+print("Quantising weights …", flush=True)
+quantize_model_weights(model)
+quant_ckpt_path = os.path.join(out_dir, "ckpt_tiled_quantized.pt")
+torch.save({
+    "model_args": checkpoint["model_args"],
+    "model": model.state_dict(),
+    "config": checkpoint.get("config", {})
+}, quant_ckpt_path)
+print(f"Saved quantized model to {quant_ckpt_path}")
+
+sample_name, sample_layer = next(
+    ((n, m) for n, m in model.named_modules() if isinstance(m, (QLinearPerChannel, QLinearTile2D))),
+    (None, None),
+)
+if sample_layer:
+    w = sample_layer.weight if hasattr(sample_layer, "weight") else sample_layer.weight_bsr.to_dense()
+    s = tensor_stats(w)
+    print(f"[quantised] Layer '{sample_name}' sparsity: {s['sparsity']*100:.2f}% | zero_count: {s['zero_count']} / {w.numel()}")
 
 model_sparse = copy.deepcopy(model)
 replace_qlinear_tiles(model_sparse)
