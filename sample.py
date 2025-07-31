@@ -279,9 +279,9 @@ if sample_layer:
 
 model_sparse = copy.deepcopy(model)
 replace_qlinear_tiles(model_sparse)
-# print(model_sparse)
-# print(model_sparse.transformer.h[4].mlp.c_fc.weight_bsr)
-# print(model_sparse.transformer.h[4].mlp.c_proj.weight_bsr)
+print(model_sparse)
+print(model_sparse.transformer.h[4].mlp.c_fc.weight_bsr)
+print(model_sparse.transformer.h[4].mlp.c_proj.weight_bsr)
 
 if compile:
     model = torch.compile(model) # requires PyTorch 2.0 (optional)
