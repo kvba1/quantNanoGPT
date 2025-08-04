@@ -4,6 +4,7 @@ import torch.nn as nn
 import cupy as cp
 from cupyx.scipy.sparse import csr_matrix
 from model import GPT, GPTConfig, QLinearTile2D
+from sample import replace_qlinear_tiles, QLinearTile2D_BSR
 import time
 
 class CuPyLinear(torch.nn.Module):
@@ -11,23 +12,28 @@ class CuPyLinear(torch.nn.Module):
         super(CuPyLinear, self).__init__()
         if not isinstance(sparse_weights, sp.csr_matrix):
             raise TypeError("sparse_weights must be a scipy.sparse.csr_matrix.")
-        
+         
         self.sparse_weights = sparse_weights
-        self.weight_gpu = csr_matrix(sparse_weights.data, sparse_weights.indices, sparse_weights.indptr, shape=sparse_weights.shape)
+        self.weight_gpu = csr_matrix((cp.asarray(sparse_weights.data), cp.asarray(sparse_weights.indices), cp.asarray(sparse_weights.indptr)), shape=sparse_weights.shape)
     
     def forward(self, x):
-        x_cp = cp.asarray(x.detach().cpu().numpy().T)
-        result_cp = self.weight_gpu @ x_cp
-        result = cp.asnumpy(result_cp.T)
-        return torch.from_numpy(result).to(x.device)
+        # (batch_size, seq_len, in_features)
+        batch_size, seq_len, in_features = x.shape
+        x_reshaped = x.view(-1, in_features).cpu().numpy()  # (batch_size * seq_len, in_features)
+        x_cp = cp.asarray(x_reshaped.T)  # (in_features, batch_size * seq_len)
+        result_cp = self.weight_gpu @ x_cp  # (out_features, batch_size * seq_len)
+        result_np = cp.asnumpy(result_cp.T).reshape(batch_size, seq_len, -1)
+        
+        return torch.from_numpy(result_np).to(x.device)
 
-def torch_linear_to_sparse(tensor, blocksize=(32, 32)):
+
+def torch_linear_to_sparse(tensor):
     if not isinstance(tensor, torch.Tensor):
         raise TypeError("Input must be a PyTorch tensor.")
     if tensor.dim() != 2:
         raise ValueError("Input tensor must be 2D.")
     
-    weight_array = tensor.detach().cpu().numpy()    
+    weight_array = tensor.detach().cpu().numpy()
     sparse_matrix = sp.csr_matrix(weight_array)
     
     return sparse_matrix
@@ -66,22 +72,20 @@ def convert_and_replace_linear(model: nn.Module) -> nn.Module:
     
     return model
 
-def benchmark_model_inference(model_dense, model_sparse, seq_len=128, batch_size=1, warmup=10, steps=50):
-    model_dense.eval()
-    model_sparse.eval()
+def benchmark_model_inference(model, seq_len=128, batch_size=1, warmup=10, steps=50):
+    model.eval()
 
-    x = torch.randint(0, model_dense.config.vocab_size, (batch_size, seq_len), device='cuda')
+    x = torch.randint(0, 65, (batch_size, seq_len), device='cuda')
 
     # warmup
     with torch.no_grad():
         for _ in range(warmup):
-            _ = model_dense(x)
-            _ = model_sparse(x)
+            _ = model(x)
 
     def timed_inference(model):
         start = torch.cuda.Event(enable_timing=True)
         end   = torch.cuda.Event(enable_timing=True)
-        torch.cuda.empty_cache()
+        #torch.cuda.empty_cache()
         torch.cuda.synchronize()
         with torch.no_grad():
             start.record()
@@ -91,24 +95,32 @@ def benchmark_model_inference(model_dense, model_sparse, seq_len=128, batch_size
             end.synchronize()
         return start.elapsed_time(end) / steps  # ms
 
-    dense_time = timed_inference(model_dense)
-    sparse_time = timed_inference(model_sparse)
-    speedup = dense_time / sparse_time
-
-    print(f"[Benchmark] Dense  : {dense_time:.2f} ms/iter")
-    print(f"[Benchmark] Sparse : {sparse_time:.2f} ms/iter")
-    print(f"[Benchmark] Speed-up: {speedup:.2f}×")
-
-    return dense_time, sparse_time, speedup
+    time = timed_inference(model)
+    return time
 
 
 torch.manual_seed(1337)
 torch.cuda.manual_seed(1337)
 
-ckpt_path = "./quantized_models/ckpt_tiled_quantized.pt"
-model_dense = load_model_from_checkpoint(ckpt_path).cuda().eval()
-model_sparse = load_model_from_checkpoint(ckpt_path).cuda().eval()
-model_sparse = convert_and_replace_linear(model_sparse)
+ckpt_path = "./out-shakespeare-char/ckpt_tiled_quantized.pt"
+ckpt_path_tiled = "./out-shakespeare-char/ckpt_tiled.pt"
 
-print("\nRunning benchmark on dense vs sparse model")
-benchmark_model_inference(model_dense, model_sparse, seq_len=128, batch_size=1)
+model_dense = load_model_from_checkpoint(ckpt_path).cuda().eval()
+
+model_sparse = load_model_from_checkpoint(ckpt_path).cuda().eval()
+model_sparse_cupy = convert_and_replace_linear(model_sparse)
+
+model_sparse_bsr = load_model_from_checkpoint(ckpt_path_tiled).cuda().eval()
+replace_qlinear_tiles(model_sparse_bsr, sparsity_threshold=0.75)
+
+print("\nRunning benchmark on dense vs sparse models")
+time_dense = benchmark_model_inference(model_dense, seq_len=2*128, batch_size=4)
+time_sparse_bsr = benchmark_model_inference(model_sparse_bsr, seq_len=2*128, batch_size=4)
+time_sparse_cupy = benchmark_model_inference(model_sparse_cupy, seq_len=2*128, batch_size=4)
+
+print(f"Dense model inference time: {time_dense:.2f} ms")
+print(f"Sparse model (BSR) inference time: {time_sparse_bsr:.2f} ms")
+print(f"Sparse model (CuPy) inference time: {time_sparse_cupy:.2f} ms")
+print(f"Speedup BSR over Dense: {time_dense / time_sparse_bsr:.2f}x")
+print(f"Speedup CuPy over Dense: {time_dense / time_sparse_cupy:.2f}x")
+print(f"Speedup CuPy over BSR: {time_sparse_bsr / time_sparse_cupy:.2f}x")
