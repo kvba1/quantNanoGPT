@@ -33,9 +33,8 @@ class Quantizer(nn.Module):
         return (2 ** e) * qw
 
 class QLinearPerChannel(nn.Module):
-    def __init__(self, in_features, out_features, device="cuda"):
+    def __init__(self, in_features, out_features):
         super().__init__()
-        self.device = device
         self.in_features = in_features
         self.out_features = out_features
         
@@ -73,9 +72,8 @@ class QLinearPerChannel(nn.Module):
         return F.linear(x, quantized_weight)
     
 class QLinearTile2D(nn.Module):
-    def __init__(self, in_features, out_features, tile_size=32, device="cuda"):
+    def __init__(self, in_features, out_features, tile_size=32):
         super().__init__()
-        self.device = device
         self.in_features = in_features
         self.out_features = out_features
         self.tile_size = tile_size
@@ -126,7 +124,7 @@ class QLinearTile2D(nn.Module):
         quantized_weight_padded = quantized_tiles.permute(0, 2, 1, 3).contiguous().view(
             self.num_tiles_row * self.tile_size, self.num_tiles_col * self.tile_size
         )
-        quantized_weight = quantized_weight_padded[:self.out_features, :self.in_features].to(self.device)
+        quantized_weight = quantized_weight_padded[:self.out_features, :self.in_features]
         
         return F.linear(x, quantized_weight)
 
